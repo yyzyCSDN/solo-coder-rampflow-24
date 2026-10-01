@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Iterable, Mapping
+from zoneinfo import ZoneInfo
 
-from .timeutil import utc
+from .timeutil import utc, local_rule_contains
 
 
 class Effect(str, Enum):
@@ -40,6 +41,7 @@ class PolicyRule:
     airport: str | None = None
     start_local: time | None = None
     end_local: time | None = None
+    zone: str | None = None
     valid_from: datetime | None = None
     valid_until: datetime | None = None
 
@@ -50,6 +52,10 @@ class PolicyRule:
             object.__setattr__(self, "valid_until", utc(self.valid_until))
         if self.valid_from and self.valid_until and self.valid_until <= self.valid_from:
             raise ValueError("invalid policy validity")
+        if (self.start_local is None) != (self.end_local is None):
+            raise ValueError("local time rule needs both start and end")
+        if self.zone is not None:
+            ZoneInfo(self.zone)
 
 
 @dataclass(frozen=True)
@@ -79,12 +85,19 @@ class PolicyEngine:
             return False
         if rule.valid_until is not None and ctx.at >= rule.valid_until:
             return False
-        if rule.start_local is None and rule.end_local is None:
+        if rule.start_local is None or rule.end_local is None:
             return True
-        local = ctx.at.timetz().replace(tzinfo=None)
-        start = rule.start_local or time.min
-        end = rule.end_local or time.max
-        return start <= local < end
+        # Same anchoring as recurring NOTAMs: the rule belongs to the local
+        # calendar day on which it starts and an end earlier than the start
+        # runs past midnight.  Check today's anchor plus yesterday's (the only
+        # other anchor whose window can reach this instant), so a night ban is
+        # enforced in its early-morning tail as well as its evening start.
+        zone = rule.zone or "UTC"
+        local_day = ctx.at.astimezone(ZoneInfo(zone)).date()
+        for anchor in (local_day, local_day - timedelta(days=1)):
+            if local_rule_contains(anchor, rule.start_local, rule.end_local, zone, ctx.at):
+                return True
+        return False
 
     def _matches(self, rule: PolicyRule, ctx: PolicyContext) -> bool:
         if rule.operations and ctx.operation not in rule.operations:

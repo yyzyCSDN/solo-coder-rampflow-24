@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Iterable, Iterator
 
@@ -100,3 +100,78 @@ def minute_ticks(window: Window, step: int = 1) -> Iterator[datetime]:
     while cur < window.end:
         yield cur
         cur += delta
+
+# Recurring wall-clock rules (night bans, periodic notices).  The weekday of a
+# rule always belongs to the day on which the rule starts; a wall end earlier
+# than the wall start runs past midnight into the next day.  Ambiguous or
+# missing wall times caused by DST are widened so every consumer of these
+# helpers interprets the same night identically (fail towards coverage rather
+# than letting one path allow and another deny).
+
+def _wall(day: date, wall: time, z: ZoneInfo, fold: int) -> datetime:
+    return datetime(day.year, day.month, day.day, wall.hour, wall.minute,
+                    wall.second, wall.microsecond, tzinfo=z, fold=fold)
+
+def local_rule_window(day: date, start: time, end: time, zone: str) -> Window:
+    """One anchored occurrence of a wall-clock rule; end<=start rolls to the next day.
+
+    Equal start/end denotes a full-day rule.  DST gaps/folds are widened: the
+    earliest possible start instant and latest possible end instant are used.
+    """
+    z = ZoneInfo(zone)
+    if start == end:
+        s = _wall(day, time.min, z, 0)
+        e = _wall(day + timedelta(days=1), time.min, z, 0)
+        return Window(s, e)
+    starts = [_wall(day, start, z, f) for f in (0, 1)]
+    if end <= start:
+        ends = [_wall(day + timedelta(days=1), end, z, f) for f in (0, 1)]
+    else:
+        ends = [_wall(day, end, z, f) for f in (0, 1)]
+    candidates = [Window(s, e) for s in starts for e in ends if e > s]
+    if not candidates:
+        raise ValueError("invalid local rule window")
+    return Window(min(w.start for w in candidates), max(w.end for w in candidates))
+
+def local_rule_contains(day: date, start: time, end: time, zone: str, instant: datetime) -> bool:
+    """Whether an aware instant falls inside the rule anchored on ``day``.
+
+    Half-open on both ends, so an overnight rule and the following day's rule
+    never disagree at the shared boundary instant.
+    """
+    w = local_rule_window(day, start, end, zone)
+    return w.contains(utc(instant))
+
+def local_rule_occurrences(
+    horizon: Window,
+    zone: str,
+    start: time,
+    end: time,
+    weekdays: frozenset[int] | None = None,
+    exception_dates: frozenset[date] = frozenset(),
+    inclusion_dates: frozenset[date] = frozenset(),
+    clip: Window | None = None,
+) -> list[Window]:
+    """All anchored rule windows overlapping ``horizon``, split at day rollover.
+
+    Each returned window belongs to one anchor date; callers that need one
+    continuous span across midnight should merge the result.  ``clip`` (e.g.
+    the NOTAM overall effective window) is applied in addition to ``horizon``.
+    """
+    z = ZoneInfo(zone)
+    first = horizon.start.astimezone(z).date() - timedelta(days=1)
+    last = horizon.end.astimezone(z).date() + timedelta(days=1)
+    out: list[Window] = []
+    cur = first
+    while cur <= last:
+        active = cur in inclusion_dates or (
+            (weekdays is None or cur.weekday() in weekdays) and cur not in exception_dates
+        )
+        if active:
+            w = local_rule_window(cur, start, end, zone).intersection(horizon)
+            if w is not None and clip is not None:
+                w = w.intersection(clip)
+            if w is not None:
+                out.append(w)
+        cur += timedelta(days=1)
+    return out

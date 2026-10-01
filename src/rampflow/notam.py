@@ -1,9 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime,date,time,timedelta
+from datetime import date,time
 from typing import Iterable
 from zoneinfo import ZoneInfo
-from .timeutil import Window,utc
+from .timeutil import Window,local_rule_occurrences,merge_windows
 from .models import Decision
 
 @dataclass(frozen=True)
@@ -14,6 +14,13 @@ class Recurrence:
     zone:str
     exception_dates:frozenset[date]=frozenset()
     inclusion_dates:frozenset[date]=frozenset()
+    def __post_init__(self):
+        if not self.weekdays and not self.inclusion_dates:
+            raise ValueError("recurrence needs weekdays or inclusion dates")
+        bad=[d for d in self.weekdays if not 0<=d<=6]
+        if bad:
+            raise ValueError("weekdays use Monday=0..Sunday=6")
+        ZoneInfo(self.zone)
 
 @dataclass(frozen=True)
 class Notam:
@@ -32,6 +39,7 @@ class NotamEffect:
     window:Window
     action:str
     priority:int
+    revision:int=0
 
 class NotamRegistry:
     def __init__(self,notams:Iterable[Notam]=()):
@@ -52,24 +60,14 @@ class NotamRegistry:
         if n.recurrence is None:
             return [base]
         r = n.recurrence
-        z = ZoneInfo(r.zone)
-        local_start = base.start.astimezone(z).date() - timedelta(days=1)
-        local_end = base.end.astimezone(z).date() + timedelta(days=1)
-        cur = local_start
-        out = []
-        while cur <= local_end:
-            active = (cur.weekday() in r.weekdays and cur not in r.exception_dates) or cur in r.inclusion_dates
-            if active:
-                start = datetime.combine(cur, r.local_start, tzinfo=z)
-                end = datetime.combine(cur, r.local_end, tzinfo=z)
-                if end > start:
-                    occurrence = Window(start, end).intersection(n.effective)
-                    if occurrence:
-                        occurrence = occurrence.intersection(horizon)
-                        if occurrence:
-                            out.append(occurrence)
-            cur += timedelta(days=1)
-        return out
+        # Anchored per local calendar day and merged across midnight, so a
+        # night ban spanning evening into the early hours is one continuous
+        # effect and an overnight periodic notice is not cut at day rollover.
+        pieces = local_rule_occurrences(
+            horizon, r.zone, r.local_start, r.local_end, r.weekdays,
+            r.exception_dates, r.inclusion_dates, clip=n.effective,
+        )
+        return merge_windows(pieces)
 
     def effects(self,scope:str,subject:str,horizon:Window,conditions:Iterable[str]=())->tuple[NotamEffect,...]:
         context=set(conditions);out=[]
@@ -77,7 +75,7 @@ class NotamRegistry:
             if n.scope!=scope or n.subject not in {subject,"*"}:continue
             if n.conditions and not n.conditions.issubset(context):continue
             for w in self._occurrences(n,horizon):
-                out.append(NotamEffect(n.notam_id,w,n.action,n.priority))
+                out.append(NotamEffect(n.notam_id,w,n.action,n.priority,self.revision))
         out.sort(key=lambda e:(e.window.start,-e.priority,e.notam_id))
         return tuple(out)
 
