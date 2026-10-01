@@ -1,9 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime,date,time,timedelta
+from datetime import date,time,timedelta
 from typing import Iterable
-from zoneinfo import ZoneInfo
-from .timeutil import Window,utc
+from .timeutil import Window,utc,zone_info,wall_window,merge_windows
 from .models import Decision
 
 @dataclass(frozen=True)
@@ -52,24 +51,27 @@ class NotamRegistry:
         if n.recurrence is None:
             return [base]
         r = n.recurrence
-        z = ZoneInfo(r.zone)
-        local_start = base.start.astimezone(z).date() - timedelta(days=1)
-        local_end = base.end.astimezone(z).date() + timedelta(days=1)
+        z = zone_info(r.zone)
+        # An overnight band attributed to a local date can end after midnight of
+        # the next day (and DST transitions shift the end by another hour), so
+        # scan two days on either side of the local horizon.
+        local_start = base.start.astimezone(z).date() - timedelta(days=2)
+        local_end = base.end.astimezone(z).date() + timedelta(days=2)
         cur = local_start
         out = []
         while cur <= local_end:
             active = (cur.weekday() in r.weekdays and cur not in r.exception_dates) or cur in r.inclusion_dates
             if active:
-                start = datetime.combine(cur, r.local_start, tzinfo=z)
-                end = datetime.combine(cur, r.local_end, tzinfo=z)
-                if end > start:
-                    occurrence = Window(start, end).intersection(n.effective)
+                occurrence = wall_window(cur, r.local_start, r.local_end, r.zone).intersection(n.effective)
+                if occurrence:
+                    occurrence = occurrence.intersection(horizon)
                     if occurrence:
-                        occurrence = occurrence.intersection(horizon)
-                        if occurrence:
-                            out.append(occurrence)
+                        out.append(occurrence)
             cur += timedelta(days=1)
-        return out
+        # Adjacent nightly bands touch at midnight (and DST fall-back bands
+        # overlap). Merge them so the post-midnight continuation is not split
+        # off and the ban cannot leak through the seam.
+        return merge_windows(out)
 
     def effects(self,scope:str,subject:str,horizon:Window,conditions:Iterable[str]=())->tuple[NotamEffect,...]:
         context=set(conditions);out=[]

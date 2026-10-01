@@ -5,7 +5,7 @@ from datetime import datetime, time
 from enum import Enum
 from typing import Iterable, Mapping
 
-from .timeutil import utc
+from .timeutil import utc, wall_time_active
 
 
 class Effect(str, Enum):
@@ -42,6 +42,8 @@ class PolicyRule:
     end_local: time | None = None
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+    zone: str = "UTC"
+    weekdays: frozenset[int] | None = None
 
     def __post_init__(self):
         if self.valid_from is not None:
@@ -50,6 +52,11 @@ class PolicyRule:
             object.__setattr__(self, "valid_until", utc(self.valid_until))
         if self.valid_from and self.valid_until and self.valid_until <= self.valid_from:
             raise ValueError("invalid policy validity")
+        if (self.start_local is None) != (self.end_local is None):
+            raise ValueError("start_local and end_local must be set together")
+        if self.weekdays is not None:
+            if not self.weekdays or any(d < 0 or d > 6 for d in self.weekdays):
+                raise ValueError("weekdays must use 0..6 (Monday..Sunday)")
 
 
 @dataclass(frozen=True)
@@ -58,11 +65,13 @@ class PolicyDecision:
     matched_rules: tuple[str, ...]
     requirements: tuple[str, ...]
     reasons: tuple[str, ...]
+    revision: int = 0
 
 
 class PolicyEngine:
     def __init__(self, rules: Iterable[PolicyRule] = ()):
         self.rules: dict[str, PolicyRule] = {}
+        self.revision = 0
         for rule in rules:
             self.add(rule)
 
@@ -70,21 +79,41 @@ class PolicyEngine:
         if rule.rule_id in self.rules:
             raise ValueError("duplicate policy rule")
         self.rules[rule.rule_id] = rule
+        self.revision += 1
 
-    def remove(self, rule_id: str) -> None:
-        self.rules.pop(rule_id, None)
+    def remove(self, rule_id: str) -> bool:
+        if rule_id not in self.rules:
+            return False
+        del self.rules[rule_id]
+        self.revision += 1
+        return True
+
+    def replace_rules(self, rules: Iterable[PolicyRule]) -> int:
+        """Atomically swap the whole rule set.
+
+        Validation happens against the proposed set first; on any conflict the
+        active rules stay untouched, so a partially applied revision can never
+        be observable.
+        """
+        next_rules: dict[str, PolicyRule] = {}
+        for rule in rules:
+            if rule.rule_id in next_rules:
+                raise ValueError(f"duplicate policy rule {rule.rule_id}")
+            next_rules[rule.rule_id] = rule
+        self.rules = next_rules
+        self.revision += 1
+        return self.revision
 
     def _time_matches(self, rule: PolicyRule, ctx: PolicyContext) -> bool:
         if rule.valid_from is not None and ctx.at < rule.valid_from:
             return False
         if rule.valid_until is not None and ctx.at >= rule.valid_until:
             return False
-        if rule.start_local is None and rule.end_local is None:
+        if rule.start_local is None:
             return True
-        local = ctx.at.timetz().replace(tzinfo=None)
-        start = rule.start_local or time.min
-        end = rule.end_local or time.max
-        return start <= local < end
+        return wall_time_active(
+            ctx.at, rule.start_local, rule.end_local, rule.zone, rule.weekdays
+        )
 
     def _matches(self, rule: PolicyRule, ctx: PolicyContext) -> bool:
         if rule.operations and ctx.operation not in rule.operations:
@@ -127,6 +156,7 @@ class PolicyEngine:
             tuple(r.rule_id for r in matched),
             tuple(r.rule_id for r in requirements),
             reasons,
+            self.revision,
         )
 
     def explain(self, ctx: PolicyContext) -> Mapping[str, object]:
@@ -138,4 +168,5 @@ class PolicyEngine:
             "matched_rules": decision.matched_rules,
             "requirements": decision.requirements,
             "reasons": decision.reasons,
+            "revision": decision.revision,
         }

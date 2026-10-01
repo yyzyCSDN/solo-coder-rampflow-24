@@ -1,10 +1,15 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 from typing import Iterable, Iterator
 
 UTC = timezone.utc
+
+@lru_cache(maxsize=None)
+def zone_info(zone: str) -> ZoneInfo:
+    return ZoneInfo(zone)
 
 def ensure_aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
@@ -20,6 +25,60 @@ def localize_wall(day: datetime, hour: int, minute: int, zone: str, fold: int = 
     z = ZoneInfo(zone)
     base = day.astimezone(z)
     return datetime(base.year, base.month, base.day, hour, minute, tzinfo=z, fold=fold)
+
+def _wall_absolutes(day: date, wall: time, zone: str) -> tuple[datetime, datetime]:
+    """Both fold interpretations of a wall-clock time, ordered as UTC instants.
+
+    For unambiguous times the two values are identical.  During a fall-back
+    transition they bracket the repeated wall-clock hour; during a spring-forward
+    gap they bracket the skipped hour.
+    """
+    z = zone_info(zone)
+    naive = datetime(day.year, day.month, day.day, wall.hour, wall.minute,
+                     wall.second, wall.microsecond)
+    first = naive.replace(tzinfo=z, fold=0).astimezone(UTC)
+    second = naive.replace(tzinfo=z, fold=1).astimezone(UTC)
+    return (first, second) if first <= second else (second, first)
+
+def wall_window(day: date, start_local: time, end_local: time, zone: str) -> Window:
+    """UTC window for a recurring daily wall-clock band in ``zone``.
+
+    When ``end_local <= start_local`` (e.g. 22:00 -> 02:00) the band is treated
+    as crossing local midnight: the end clock is read on the following calendar
+    day and the whole band is attributed to ``day`` for weekday purposes.  Equal
+    start/end means a full day (including the repeated hour on a fall-back day).
+
+    Ambiguous or missing wall times around DST transitions are resolved toward
+    coverage: the earliest possible absolute start and the latest possible
+    absolute end.  Callers enforcing bans must not release time the rule might
+    cover, so widening by the transition offset is the conservative choice.
+    """
+    end_day = day + timedelta(days=1) if end_local <= start_local else day
+    start = _wall_absolutes(day, start_local, zone)[0]
+    end = _wall_absolutes(end_day, end_local, zone)[1]
+    return Window(start, end)
+
+def wall_time_active(instant: datetime, start_local: time, end_local: time,
+                     zone: str, weekdays: frozenset[int] | set[int] | tuple[int, ...] | None = None) -> bool:
+    """Whether ``instant`` falls inside a recurring local wall-clock band.
+
+    Shares the exact window math of :func:`wall_window`, so a rule evaluated at
+    an instant and the same rule expanded into windows can never disagree.  For
+    overnight bands the post-midnight portion is attributed to the previous
+    calendar day, which is also the day whose weekday is checked.
+    """
+    t = utc(instant)
+    z = zone_info(zone)
+    local_day = t.astimezone(z).date()
+    anchors = [local_day]
+    if end_local <= start_local:
+        anchors.append(local_day - timedelta(days=1))
+    allowed = None if weekdays is None else frozenset(weekdays)
+    for anchor in anchors:
+        if wall_window(anchor, start_local, end_local, zone).contains(t) \
+                and (allowed is None or anchor.weekday() in allowed):
+            return True
+    return False
 
 def minutes_between(start: datetime, end: datetime) -> int:
     a, b = utc(start), utc(end)
